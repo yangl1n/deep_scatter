@@ -45,13 +45,16 @@ class ScatteringNet(nn.Module):
         reducing output channels from ``C_in * (1+L)`` to ``C_in``.
         This is more faithful to the standard scattering transform, which
         only uses band-pass paths as input to the next scattering order.
+    random_init : bool
+        If True, skip wavelet initialization and keep PyTorch defaults
+        (Kaiming uniform).  Used for random-baseline experiments.
     """
 
     def __init__(self, n_blocks=3, in_channels=3, in_spatial=32,
                  nb_classes=10, L=8, kernel_size=7,
                  learnable=False, modulus_type='complex_modulus',
                  mixing_horizon=None, global_avg_pool=False,
-                 lowpass_last=False):
+                 lowpass_last=False, random_init=False):
         super().__init__()
         assert kernel_size % 2 == 1, f"kernel_size must be odd, got {kernel_size}"
         min_spatial = 2 ** n_blocks
@@ -74,7 +77,8 @@ class ScatteringNet(nn.Module):
                                     learnable=learnable,
                                     modulus_type=modulus_type,
                                     mixing_horizon=mixing_horizon,
-                                    lowpass_only=lp_only)
+                                    lowpass_only=lp_only,
+                                    random_init=random_init)
             blocks.append(block)
             ch = block.out_channels
             spatial //= 2

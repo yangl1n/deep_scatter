@@ -61,7 +61,7 @@ class ExperimentLogger:
         self.save_dir = save_dir
         self.config = vars(args) if args is not None else {}
         self.results = {}
-        self.curves = {"phase_a": [], "phase_b": []}
+        self.curves = {"phase_a": [], "phase_b": [], "joint": []}
 
     def log_epoch(self, phase, epoch, train_loss, val_loss, val_acc, val_acc5):
         """Append one epoch's metrics to the training curve."""

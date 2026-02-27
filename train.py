@@ -72,6 +72,10 @@ def parse_args():
                    help="apply adaptive avg pool to 1x1 before classifier")
     g.add_argument("--lowpass-last", action="store_true",
                    help="final block outputs only low-pass (phi) path")
+    g.add_argument("--random-init", action="store_true",
+                   help="skip wavelet initialization, use Kaiming random init")
+    g.add_argument("--joint", action="store_true",
+                   help="single-phase joint training (skip Phase A/B split)")
 
     # Training phases
     g = p.add_argument_group("Training phases")
@@ -151,7 +155,7 @@ def _run_phase(tag, model, train_loader, val_loader, optimizer, scheduler,
             print(f"  Val    loss={val_loss:.4f}  acc@1={val_acc1:.2f}%  "
                   f"acc@5={val_acc5:.2f}%{marker}")
 
-            phase_key = "phase_a" if tag == "Phase-A" else "phase_b"
+            phase_key = {"Phase-A": "phase_a", "Phase-B": "phase_b"}.get(tag, "joint")
             logger.log_epoch(phase_key, epoch, train_loss, val_loss,
                              val_acc1, val_acc5)
 
@@ -220,7 +224,7 @@ def main():
               f"train {info['actual_train_samples']}  "
               f"val {info['test_samples']}")
 
-    # ---- Model (frozen extractor) ----
+    # ---- Model ----
     model = ScatteringNet(
         n_blocks=args.n_blocks,
         in_channels=info["in_channels"],
@@ -228,11 +232,12 @@ def main():
         nb_classes=info["nb_classes"],
         L=args.L,
         kernel_size=args.kernel_size,
-        learnable=False,
+        learnable=args.joint,
         modulus_type=args.modulus_type,
         mixing_horizon=args.mixing_horizon,
         global_avg_pool=args.global_avg_pool,
         lowpass_last=args.lowpass_last,
+        random_init=args.random_init,
     ).to(device)
 
     if distributed:
@@ -243,10 +248,13 @@ def main():
     ps = raw.param_summary()
     bs = raw.block_summary()
     if is_main_process():
+        init_tag = "random" if args.random_init else "wavelet"
+        mode_tag = "joint" if args.joint else "two-phase"
         print(f"Model: {args.n_blocks} blocks, L={args.L}, "
               f"modulus={args.modulus_type}, "
               f"mixing_horizon={args.mixing_horizon}, "
               f"gap={args.global_avg_pool}, lowpass_last={args.lowpass_last}")
+        print(f"  init={init_tag}, training={mode_tag}")
         print(f"Parameters: {ps['total']:,} total, {ps['trainable']:,} trainable")
         print(f"  Extractor (blocks): {ps['extractor']:,}")
         print(f"  Classifier (head):  {ps['classifier']:,}")
@@ -277,10 +285,55 @@ def main():
         logger.set_result(f"n_params_{k}", v)
 
     cudnn.benchmark = True
+    head_params = list(raw.bn.parameters()) + list(raw.classifier.parameters())
+
+    if args.joint:
+        _run_joint(args, model, raw, head_params, train_loader, val_loader,
+                   criterion, device, distributed, local_rank, logger)
+    else:
+        _run_two_phase(args, model, raw, head_params, train_loader, val_loader,
+                       criterion, device, distributed, local_rank, logger)
+
+    if is_main_process():
+        logger.save()
+
+    cleanup_distributed()
+
+
+def _run_joint(args, model, raw, head_params, train_loader, val_loader,
+               criterion, device, distributed, local_rank, logger):
+    """Single-phase joint training — all parameters trainable from the start."""
+    save_dir = os.path.join(args.save_dir, "joint")
+
+    if is_main_process():
+        print("\n" + "=" * 60)
+        print("Joint training (all parameters)")
+        print("=" * 60 + "\n")
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr_head, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs)
+
+    best_acc = _run_phase(
+        "Joint", model, train_loader, val_loader,
+        optimizer, scheduler, criterion, device,
+        epochs=args.epochs, patience=args.patience,
+        print_freq=args.print_freq, save_dir=save_dir,
+        logger=logger)
+
+    logger.set_result("joint_acc", best_acc)
+    logger.set_result("joint_err", round(100.0 - best_acc, 4))
+    if is_main_process():
+        print(f"\nJoint training complete. acc = {best_acc:.2f}%")
+
+
+def _run_two_phase(args, model, raw, head_params, train_loader, val_loader,
+                   criterion, device, distributed, local_rank, logger):
+    """Standard two-phase pipeline: freeze extractor, then fine-tune."""
     phase_a_dir = os.path.join(args.save_dir, "phase_a")
     phase_b_dir = os.path.join(args.save_dir, "phase_b")
-
-    head_params = list(raw.bn.parameters()) + list(raw.classifier.parameters())
 
     # ================================================================
     # Phase A: train classifier head (feature extractor frozen)
@@ -319,8 +372,7 @@ def main():
         print("Phase B: Joint fine-tune")
         print("=" * 60 + "\n")
 
-    # Baseline evaluation before fine-tuning
-    _, baseline_acc, baseline_acc5 = run_epoch(
+    _, baseline_acc, _ = run_epoch(
         val_loader, model, criterion, None, device,
         is_training=False, print_freq=0, verbose=False)
     logger.set_result("baseline_acc", baseline_acc)
@@ -368,12 +420,6 @@ def main():
         print(f"  finetune_gain  = {finetune_gain:+.2f}%")
         print(f"  filter_delta   = {delta_l2:.4f} "
               f"(relative: {delta_rel:.4f})")
-
-    # ---- Save experiment log ----
-    if is_main_process():
-        logger.save()
-
-    cleanup_distributed()
 
 
 if __name__ == "__main__":

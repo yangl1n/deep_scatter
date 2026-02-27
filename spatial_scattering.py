@@ -65,7 +65,7 @@ class WaveletConv(nn.Module):
 
     def __init__(self, in_channels, L, kernel_size=7, sigma=0.8,
                  xi=None, slant=None, mixing_horizon=None,
-                 lowpass_only=False):
+                 lowpass_only=False, random_init=False):
         super().__init__()
         self.L = L
         self.in_channels = in_channels
@@ -90,7 +90,8 @@ class WaveletConv(nn.Module):
             self.psi_imag = nn.Conv2d(in_channels, in_channels * L, kernel_size,
                                       padding=pad, bias=False, groups=groups)
 
-        self._init_weights(kernel_size, sigma, xi, slant)
+        if not random_init:
+            self._init_weights(kernel_size, sigma, xi, slant)
 
     @staticmethod
     def _compute_groups(c_in, mixing_horizon):
@@ -168,11 +169,14 @@ class ScatteringBlock(nn.Module):
     lowpass_only : bool
         If True, only the low-pass (phi) convolution and pooling are created.
         No band-pass parameters (psi) or phase-collapse layers are allocated.
+    random_init : bool
+        If True, skip wavelet initialization and keep PyTorch defaults
+        (Kaiming uniform).  Used for random-baseline experiments.
     """
 
     def __init__(self, in_channels, L=8, kernel_size=7, learnable=True,
                  modulus_type='phase_relu', mixing_horizon=None,
-                 lowpass_only=False):
+                 lowpass_only=False, random_init=False):
         super().__init__()
         assert kernel_size % 2 == 1, f"kernel_size must be odd, got {kernel_size}"
         assert modulus_type in ('phase_relu', 'complex_modulus')
@@ -184,7 +188,8 @@ class ScatteringBlock(nn.Module):
 
         self.wavelets = WaveletConv(in_channels, L, kernel_size=kernel_size,
                                     mixing_horizon=mixing_horizon,
-                                    lowpass_only=lowpass_only)
+                                    lowpass_only=lowpass_only,
+                                    random_init=random_init)
         self.actual_horizon = self.wavelets.actual_horizon
         self.requested_horizon = self.wavelets.requested_horizon
         self.pool = AvgPoolConv()
@@ -194,7 +199,8 @@ class ScatteringBlock(nn.Module):
             self.phase_collapse = nn.Conv2d(
                 in_channels * 4 * L, in_channels * L,
                 kernel_size=1, groups=in_channels * L, bias=False)
-            self.phase_collapse.weight.data.fill_(1.0 / math.sqrt(2))
+            if not random_init:
+                self.phase_collapse.weight.data.fill_(1.0 / math.sqrt(2))
 
         if not learnable:
             self.freeze()

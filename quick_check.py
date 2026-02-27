@@ -61,6 +61,8 @@ def parse_args():
                    help="apply adaptive avg pool to 1x1 before classifier")
     p.add_argument("--lowpass-last", action="store_true",
                    help="final block outputs only low-pass (phi) path")
+    p.add_argument("--random-init", action="store_true",
+                   help="skip wavelet initialization, use Kaiming random init")
     p.add_argument("--learnable", action="store_true",
                    help="allow wavelet weights to be updated during training")
 
@@ -221,6 +223,7 @@ def main():
         mixing_horizon=args.mixing_horizon,
         global_avg_pool=args.global_avg_pool,
         lowpass_last=args.lowpass_last,
+        random_init=args.random_init,
     ).to(device)
 
     ps = model.param_summary()
