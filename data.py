@@ -1,6 +1,6 @@
 """Dataset construction and stratified subset sampling.
 
-Supports CIFAR-10 and ImageNet with standard augmentation pipelines.
+Supports CIFAR-10, CIFAR-100, and ImageNet with standard augmentation pipelines.
 """
 
 import os
@@ -24,6 +24,13 @@ DATASET_CONFIGS = {
         "nb_classes": 10,
         "mean": (0.4914, 0.4822, 0.4465),
         "std": (0.2470, 0.2435, 0.2616),
+    },
+    "cifar100": {
+        "in_channels": 3,
+        "in_spatial": 32,
+        "nb_classes": 100,
+        "mean": (0.5071, 0.4867, 0.4408),
+        "std": (0.2675, 0.2565, 0.2761),
     },
     "imagenet": {
         "in_channels": 3,
@@ -152,6 +159,13 @@ def build_dataloaders(args):
         train_ds = datasets.CIFAR10(
             args.data_dir, train=True, download=True, transform=train_tf)
         val_ds = datasets.CIFAR10(
+            args.data_dir, train=False, download=True, transform=val_tf)
+
+    elif args.dataset == "cifar100":
+        train_tf, val_tf = _cifar10_transforms(mean, std)
+        train_ds = datasets.CIFAR100(
+            args.data_dir, train=True, download=True, transform=train_tf)
+        val_ds = datasets.CIFAR100(
             args.data_dir, train=False, download=True, transform=val_tf)
 
     elif args.dataset == "imagenet":

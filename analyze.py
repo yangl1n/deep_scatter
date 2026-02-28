@@ -1,111 +1,88 @@
 """Analyze experiment results from train.py JSON logs.
 
-Reads all ``results_*.json`` files from a directory, builds a summary
-table, and produces grouped comparison plots:
+Reads all ``results_*.json`` files from ``cifar_exps/`` (or another directory),
+builds a summary table, and produces comparison plots:
 
-1. Architecture comparison (grouped bar, full-data only)
-2. Box plot — accuracy by modulus type (scattering init only)
-3. Box plot — accuracy by depth (scattering init only)
-4. Data efficiency curves per architecture family
-5. Box plot — fine-tune gain by data fraction
-6. Filter delta vs. fine-tune gain (labeled scatter)
-7. Paired scattering vs random init bar chart
-8. Three-line data efficiency (random < scat-frozen < scat-finetuned)
-9. Scattering advantage over random vs data size
-10. Per-experiment training curves
+ 1. Architecture comparison (grouped bar, full-data)
+ 2. Box plot -- accuracy by modulus type
+ 3. Box plot -- accuracy by depth
+ 4. Box plot -- fine-tune gain by data fraction
+ 5. Filter delta vs fine-tune gain (scatter)
+ 6. Data efficiency (three-line: random < scat-frozen < scat-tuned)
+ 7. Scattering advantage over random vs data size
+ 8. Heatmap (architecture x data fraction)
+ 9. L2 penalty effect
+10. Paired difference (scat - random) horizontal bars
+11. Mixing horizon comparison (4-block only)
+12. Best architecture per data fraction
+13. Per-experiment training curves (optional)
 
 Usage
 -----
-# Print summary table and save plots:
-    python analyze.py --results-dir cifar_all_results
-
-# Recursively search subdirectories for results:
-    python analyze.py --results-dir cifar_runs --recursive
-
-# Show plots interactively:
-    python analyze.py --results-dir cifar_all_results --interactive
-
-# Also plot per-experiment training curves:
-    python analyze.py --results-dir cifar_all_results --curves
+    python analyze.py --results-dir cifar_exps --recursive
+    python analyze.py --results-dir cifar_exps --recursive --curves --interactive
 """
 
 import argparse
 import glob
 import json
 import os
-import re
 import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+FRAC_ORDER = ["10%", "30%", "50%", "100%"]
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _make_label(row):
-    """Derive a short human-readable label from save_dir."""
-    sd = row.get("save_dir", "")
-    if sd:
-        return sd.rstrip("/").split("/")[-1]
-    parts = []
-    parts.append(f"{row.get('n_blocks', '?')}b")
-    mt = row.get("modulus_type", "")
-    parts.append("prelu" if mt == "phase_relu" else "cmod")
-    return "_".join(parts)
+    """Last component of save_dir, e.g. '3b_prelu_4L_s01'."""
+    return row.get("save_dir", "").rstrip("/").split("/")[-1]
 
 
 def _data_fraction_label(row):
-    """Map train_size to a readable fraction string."""
     ts = row.get("train_size")
-    if ts is None or not isinstance(ts, (int, float)) or np.isnan(ts) or ts >= 1.0:
+    if ts is None or (isinstance(ts, float) and np.isnan(ts)) or ts >= 1.0:
         return "100%"
     return f"{int(ts * 100)}%"
 
 
 def _is_random(row):
-    """Check if an experiment used random initialization."""
-    val = row.get("random_init", False)
-    if pd.isna(val):
-        return False
-    return bool(val)
+    return bool(row.get("random_init", False))
 
 
 def _arch_key(row):
-    """Derive a canonical architecture key ignoring init type and data fraction.
+    """Canonical architecture tuple (ignores init type, data fraction, l2)."""
+    mh = row.get("mixing_horizon")
+    if isinstance(mh, float) and np.isnan(mh):
+        mh = None
+    return (int(row["n_blocks"]), row["modulus_type"],
+            int(row["L"]), mh)
 
-    E.g. both ``3b_prelu`` and ``3b_prelu_rand`` map to
-    ``(3, 'phase_relu', 8, 7, None, False, False)``.
 
-    NaN values are replaced with None so that tuple equality works
-    (``NaN != NaN`` but ``None == None``).
-    """
-    def _nan_to_none(val):
-        try:
-            if pd.isna(val):
-                return None
-        except (TypeError, ValueError):
-            pass
-        return val
-
-    return (
-        _nan_to_none(row.get("n_blocks")),
-        row.get("modulus_type"),
-        _nan_to_none(row.get("L")),
-        _nan_to_none(row.get("kernel_size")),
-        _nan_to_none(row.get("mixing_horizon")),
-        row.get("global_avg_pool", False),
-        row.get("lowpass_last", False),
-    )
+def _arch_short_label(row):
+    """Short label like '3b_prelu_4L' or '4b_cmod_8L_h27'."""
+    nb = int(row["n_blocks"])
+    mod = "prelu" if row["modulus_type"] == "phase_relu" else "cmod"
+    lv = int(row["L"])
+    mh = row.get("mixing_horizon")
+    if isinstance(mh, float) and np.isnan(mh):
+        mh = None
+    if mh is not None:
+        return f"{nb}b_{mod}_{lv}L_h{int(mh)}"
+    return f"{nb}b_{mod}_{lv}L"
 
 
 def _find_matched_pairs(df):
-    """Find (scattering, random) experiment pairs with the same architecture.
+    """Match each random experiment to the best scattering experiment
+    (highest finetune_acc across l2 settings) with the same arch + data_frac.
 
-    Returns a list of dicts with keys: arch_key, scat_row, rand_row,
-    data_frac, actual_train_samples.
+    Returns list of dicts: arch_key, label, scat, rand, data_frac,
+    actual_train_samples.
     """
     pairs = []
     scat = df[~df["_is_random"]]
@@ -117,10 +94,12 @@ def _find_matched_pairs(df):
         candidates = scat[(scat["_arch_key"] == key) & (scat["data_frac"] == frac)]
         if candidates.empty:
             continue
-        s_row = candidates.iloc[0]
+        valid = candidates[candidates["finetune_acc"].notna()]
+        s_row = (valid.loc[valid["finetune_acc"].idxmax()]
+                 if not valid.empty else candidates.iloc[0])
         pairs.append({
             "arch_key": key,
-            "label": s_row["label"],
+            "label": s_row["_arch_label"],
             "scat": s_row,
             "rand": r_row,
             "data_frac": frac,
@@ -130,17 +109,7 @@ def _find_matched_pairs(df):
 
 
 def _boxplot_with_strip(ax, groups, positions, colors, width=0.6):
-    """Draw box plots with overlaid individual points.
-
-    Parameters
-    ----------
-    groups : list of array-like
-        Data arrays, one per box.
-    positions : array-like
-        X positions for each box.
-    colors : list of str
-        Face colors for each box.
-    """
+    """Box plots with overlaid jittered points."""
     bp = ax.boxplot(groups, positions=positions, widths=width,
                     patch_artist=True, showfliers=False,
                     medianprops=dict(color="black", linewidth=1.5))
@@ -157,26 +126,25 @@ def _boxplot_with_strip(ax, groups, positions, colors, width=0.6):
                    edgecolors="black", linewidth=0.5, alpha=0.85)
 
 
+def _save(fig, save_dir, name):
+    path = os.path.join(save_dir, name)
+    fig.savefig(path, dpi=150)
+    print(f"  Saved {path}")
+    return fig
+
+
 # ---------------------------------------------------------------------------
-# Load experiments
+# Load & summarize
 # ---------------------------------------------------------------------------
 
 def load_experiments(results_dir, recursive=False):
-    """Read all results_*.json files into a DataFrame.
-
-    Each row is one experiment.  Columns come from merging the ``config``
-    and ``results`` dicts.  The raw ``curves`` dict is kept in a hidden
-    ``_curves`` column for optional per-experiment plotting.
-    """
-    if recursive:
-        pattern = os.path.join(results_dir, "**", "results_*.json")
-        paths = sorted(glob.glob(pattern, recursive=True))
-    else:
-        pattern = os.path.join(results_dir, "results_*.json")
-        paths = sorted(glob.glob(pattern))
+    """Read all results_*.json into a DataFrame."""
+    pattern = os.path.join(results_dir, "**" if recursive else "",
+                           "results_*.json")
+    paths = sorted(glob.glob(pattern, recursive=recursive))
 
     if not paths:
-        print(f"No results_*.json files found in {results_dir}"
+        print(f"No results_*.json found in {results_dir}"
               f"{' (recursive)' if recursive else ''}")
         sys.exit(1)
 
@@ -195,13 +163,16 @@ def load_experiments(results_dir, recursive=False):
     df["label"] = df.apply(_make_label, axis=1)
     df["data_frac"] = df.apply(_data_fraction_label, axis=1)
     df["_is_random"] = df.apply(_is_random, axis=1)
-    df["_arch_key"] = df.apply(lambda r: _arch_key(r), axis=1)
+    df["_arch_key"] = df.apply(_arch_key, axis=1)
+    df["_arch_label"] = df.apply(_arch_short_label, axis=1)
+
     if "joint_acc" in df.columns and "finetune_acc" in df.columns:
         df["best_acc"] = df["joint_acc"].fillna(df["finetune_acc"])
     elif "joint_acc" in df.columns:
         df["best_acc"] = df["joint_acc"]
     elif "finetune_acc" in df.columns:
         df["best_acc"] = df["finetune_acc"]
+
     n_scat = (~df["_is_random"]).sum()
     n_rand = df["_is_random"].sum()
     print(f"Loaded {len(df)} experiment(s) from {results_dir}"
@@ -209,14 +180,9 @@ def load_experiments(results_dir, recursive=False):
     return df
 
 
-# ---------------------------------------------------------------------------
-# Summary table
-# ---------------------------------------------------------------------------
-
 SUMMARY_COLS = [
     "label", "random_init", "joint", "n_blocks", "L", "modulus_type",
-    "kernel_size", "mixing_horizon", "global_avg_pool", "lowpass_last",
-    "actual_train_samples",
+    "mixing_horizon", "l2_penalty", "actual_train_samples",
     "head_acc", "finetune_acc", "finetune_gain", "joint_acc",
     "filter_delta_relative",
     "n_params_extractor", "n_params_classifier",
@@ -244,7 +210,7 @@ def print_summary(df, save_dir=None):
 
 
 # ---------------------------------------------------------------------------
-# Plot 1: Architecture comparison — grouped bar (full-data only)
+# Plot 1: Architecture comparison (grouped bar, full-data)
 # ---------------------------------------------------------------------------
 
 def plot_arch_comparison(df, save_dir):
@@ -252,46 +218,38 @@ def plot_arch_comparison(df, save_dir):
     if full.empty:
         return None
 
-    has_head = "head_acc" in full.columns and full["head_acc"].notna().any()
-    has_ft = "finetune_acc" in full.columns and full["finetune_acc"].notna().any()
-    has_joint = "joint_acc" in full.columns and full["joint_acc"].notna().any()
-    if not (has_head or has_joint):
-        return None
+    scat_all = full[~full["_is_random"]]
+    # Pick the best l2 variant per architecture
+    best_idx = scat_all.groupby("_arch_label")["finetune_acc"].idxmax()
+    scat = scat_all.loc[best_idx].sort_values(["n_blocks", "modulus_type"])
+    rand = full[full["_is_random"]].sort_values(["n_blocks", "modulus_type"])
 
-    full = full.sort_values(["n_blocks", "modulus_type"])
-    labels = full["label"].values
+    labels = scat["_arch_label"].values
     x = np.arange(len(labels))
+    width = 0.25
 
-    n_bars = sum([has_head, has_ft, has_joint])
-    width = 0.8 / max(n_bars, 1)
-    offsets = np.linspace(-(n_bars - 1) * width / 2,
-                          (n_bars - 1) * width / 2, n_bars)
+    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 1.0), 6))
 
-    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.9), 6))
-    bar_idx = 0
-
-    if has_head:
-        ax.bar(x + offsets[bar_idx], full["head_acc"].fillna(0), width,
-               label="Head only (Phase A)", color="tab:blue", alpha=0.7)
-        bar_idx += 1
-
-    if has_ft:
-        bars_b = ax.bar(x + offsets[bar_idx], full["finetune_acc"].fillna(0),
-                        width, label="Fine-tuned (Phase B)",
-                        color="tab:orange", alpha=0.7)
-        if "finetune_gain" in full.columns:
-            for bar, gain in zip(bars_b, full["finetune_gain"]):
+    if "head_acc" in scat.columns:
+        ax.bar(x - width, scat["head_acc"].fillna(0), width,
+               label="Scat head (Phase A)", color="tab:blue", alpha=0.7)
+    if "finetune_acc" in scat.columns:
+        bars = ax.bar(x, scat["finetune_acc"].fillna(0), width,
+                      label="Scat fine-tuned (Phase B)", color="tab:orange", alpha=0.7)
+        if "finetune_gain" in scat.columns:
+            for bar, gain in zip(bars, scat["finetune_gain"]):
                 if pd.notna(gain):
                     ax.text(bar.get_x() + bar.get_width() / 2,
                             bar.get_height() + 0.3,
                             f"+{gain:.1f}" if gain >= 0 else f"{gain:.1f}",
                             ha="center", va="bottom", fontsize=7)
-        bar_idx += 1
 
-    if has_joint:
-        ax.bar(x + offsets[bar_idx], full["joint_acc"].fillna(0), width,
-               label="Joint training", color="tab:green", alpha=0.7)
-        bar_idx += 1
+    rand_by_arch = rand.set_index("_arch_label")
+    rand_vals = [rand_by_arch.loc[al, "joint_acc"]
+                 if al in rand_by_arch.index else 0
+                 for al in labels]
+    ax.bar(x + width, rand_vals, width,
+           label="Random (joint)", color="tab:red", alpha=0.7)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
@@ -300,203 +258,90 @@ def plot_arch_comparison(df, save_dir):
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_arch_comparison.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_arch_comparison.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 2: Box plot — accuracy by modulus type
+# Plot 2: Box plot -- accuracy by modulus type
 # ---------------------------------------------------------------------------
 
 def plot_box_modulus(df, save_dir):
     scat = df[~df["_is_random"]]
-    if "modulus_type" not in scat.columns or "head_acc" not in scat.columns:
-        return None
-
     types = sorted(scat["modulus_type"].dropna().unique())
     if len(types) < 2:
         return None
 
-    has_ft = "finetune_acc" in scat.columns and scat["finetune_acc"].notna().any()
     fig, ax = plt.subplots(figsize=(8, 5))
-
     groups_head = [scat.loc[scat["modulus_type"] == t, "head_acc"].dropna().values
                    for t in types]
+    groups_ft = [scat.loc[scat["modulus_type"] == t, "finetune_acc"].dropna().values
+                 for t in types]
 
-    if has_ft:
-        groups_ft = [scat.loc[scat["modulus_type"] == t, "finetune_acc"].dropna().values
-                     for t in types]
-        pos_h = np.arange(len(types)) * 2.5
-        pos_f = pos_h + 0.8
-        _boxplot_with_strip(ax, groups_head, pos_h,
-                            ["tab:blue"] * len(types))
-        _boxplot_with_strip(ax, groups_ft, pos_f,
-                            ["tab:orange"] * len(types))
-        ax.set_xticks(pos_h + 0.4)
-        ax.legend(handles=[
-            plt.Rectangle((0, 0), 1, 1, fc="tab:blue", alpha=0.5),
-            plt.Rectangle((0, 0), 1, 1, fc="tab:orange", alpha=0.5),
-        ], labels=["Head (A)", "Fine-tuned (B)"])
-    else:
-        pos_h = np.arange(len(types))
-        _boxplot_with_strip(ax, groups_head, pos_h,
-                            ["tab:blue"] * len(types))
-        ax.set_xticks(pos_h)
-
+    pos_h = np.arange(len(types)) * 2.5
+    pos_f = pos_h + 0.8
+    _boxplot_with_strip(ax, groups_head, pos_h, ["tab:blue"] * len(types))
+    _boxplot_with_strip(ax, groups_ft, pos_f, ["tab:orange"] * len(types))
+    ax.set_xticks(pos_h + 0.4)
     ax.set_xticklabels(types)
+    ax.legend(handles=[
+        plt.Rectangle((0, 0), 1, 1, fc="tab:blue", alpha=0.5),
+        plt.Rectangle((0, 0), 1, 1, fc="tab:orange", alpha=0.5),
+    ], labels=["Head (A)", "Fine-tuned (B)"])
     ax.set_ylabel("Val accuracy (%)")
-    ax.set_title("Accuracy by Modulus Type (scattering init only)")
+    ax.set_title("Accuracy by Modulus Type (scattering init)")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_box_modulus.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_box_modulus.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 3: Box plot — accuracy by depth
+# Plot 3: Box plot -- accuracy by depth
 # ---------------------------------------------------------------------------
 
 def plot_box_depth(df, save_dir):
     scat = df[~df["_is_random"]]
-    if "n_blocks" not in scat.columns or "head_acc" not in scat.columns:
-        return None
-
     depths = sorted(scat["n_blocks"].dropna().unique())
     if len(depths) < 2:
         return None
 
-    has_ft = "finetune_acc" in scat.columns and scat["finetune_acc"].notna().any()
     fig, ax = plt.subplots(figsize=(8, 5))
-
     groups_head = [scat.loc[scat["n_blocks"] == d, "head_acc"].dropna().values
                    for d in depths]
+    groups_ft = [scat.loc[scat["n_blocks"] == d, "finetune_acc"].dropna().values
+                 for d in depths]
 
-    if has_ft:
-        groups_ft = [scat.loc[scat["n_blocks"] == d, "finetune_acc"].dropna().values
-                     for d in depths]
-        pos_h = np.arange(len(depths)) * 2.5
-        pos_f = pos_h + 0.8
-        _boxplot_with_strip(ax, groups_head, pos_h,
-                            ["tab:blue"] * len(depths))
-        _boxplot_with_strip(ax, groups_ft, pos_f,
-                            ["tab:orange"] * len(depths))
-        ax.set_xticks(pos_h + 0.4)
-        ax.legend(handles=[
-            plt.Rectangle((0, 0), 1, 1, fc="tab:blue", alpha=0.5),
-            plt.Rectangle((0, 0), 1, 1, fc="tab:orange", alpha=0.5),
-        ], labels=["Head (A)", "Fine-tuned (B)"])
-    else:
-        pos_h = np.arange(len(depths))
-        _boxplot_with_strip(ax, groups_head, pos_h,
-                            ["tab:blue"] * len(depths))
-        ax.set_xticks(pos_h)
-
+    pos_h = np.arange(len(depths)) * 2.5
+    pos_f = pos_h + 0.8
+    _boxplot_with_strip(ax, groups_head, pos_h, ["tab:blue"] * len(depths))
+    _boxplot_with_strip(ax, groups_ft, pos_f, ["tab:orange"] * len(depths))
+    ax.set_xticks(pos_h + 0.4)
     ax.set_xticklabels([str(int(d)) for d in depths])
+    ax.legend(handles=[
+        plt.Rectangle((0, 0), 1, 1, fc="tab:blue", alpha=0.5),
+        plt.Rectangle((0, 0), 1, 1, fc="tab:orange", alpha=0.5),
+    ], labels=["Head (A)", "Fine-tuned (B)"])
     ax.set_xlabel("Number of blocks")
     ax.set_ylabel("Val accuracy (%)")
-    ax.set_title("Accuracy by Network Depth (scattering init only)")
+    ax.set_title("Accuracy by Network Depth (scattering init)")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_box_depth.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_box_depth.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 4: Data efficiency curves per architecture family
-# ---------------------------------------------------------------------------
-
-def _identify_families(df):
-    """Find architecture families that were tested at multiple data sizes.
-
-    Returns a dict mapping family_label -> sub-DataFrame sorted by sample count.
-    """
-    if "actual_train_samples" not in df.columns:
-        return {}
-
-    families = {}
-    for label, grp in df.groupby("label"):
-        if len(grp) > 1:
-            families[label] = grp.sort_values("actual_train_samples")
-            continue
-        row = grp.iloc[0]
-        ts = row.get("train_size")
-        if ts is not None and ts < 1.0:
-            base = label.rsplit("_s", 1)[0]
-            families.setdefault(base, pd.DataFrame())
-            families[base] = pd.concat([families[base], grp])
-
-    full = df[df["data_frac"] == "100%"]
-    for label, grp in families.items():
-        if "100%" not in grp["data_frac"].values:
-            match = full[full["label"] == label]
-            if not match.empty:
-                families[label] = pd.concat([grp, match])
-
-    return {k: v.sort_values("actual_train_samples").drop_duplicates("actual_train_samples")
-            for k, v in families.items() if len(v) >= 2}
-
-
-def plot_data_efficiency(df, save_dir):
-    families = _identify_families(df)
-    if not families:
-        return None
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    cmap = plt.get_cmap("tab10")
-
-    for i, (name, grp) in enumerate(sorted(families.items())):
-        color = cmap(i % 10)
-        samples = grp["actual_train_samples"].values
-
-        ax.plot(samples, grp["head_acc"].values, "o--",
-                color=color, alpha=0.6, label=f"{name} head")
-        if "finetune_acc" in grp.columns and grp["finetune_acc"].notna().any():
-            ax.plot(samples, grp["finetune_acc"].values, "s-",
-                    color=color, label=f"{name} fine-tuned")
-
-    ax.set_xscale("log")
-    ax.set_xlabel("Training samples")
-    ax.set_ylabel("Val accuracy (%)")
-    ax.set_title("Data Efficiency by Architecture Family")
-    ax.legend(fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_data_efficiency.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Plot 5: Box plot — fine-tune gain by data fraction
+# Plot 4: Box plot -- fine-tune gain by data fraction
 # ---------------------------------------------------------------------------
 
 def plot_box_gain(df, save_dir):
-    if "finetune_gain" not in df.columns:
-        return None
-
     sub = df.dropna(subset=["finetune_gain"])
     if sub.empty:
         return None
 
-    frac_order = ["10%", "30%", "50%", "100%"]
-    fracs = [f for f in frac_order if f in sub["data_frac"].values]
+    fracs = [f for f in FRAC_ORDER if f in sub["data_frac"].values]
     if not fracs:
         return None
 
-    groups = [sub.loc[sub["data_frac"] == f, "finetune_gain"].values
-              for f in fracs]
-
+    groups = [sub.loc[sub["data_frac"] == f, "finetune_gain"].values for f in fracs]
     fig, ax = plt.subplots(figsize=(8, 5))
     positions = np.arange(len(fracs))
     _boxplot_with_strip(ax, groups, positions, ["tab:green"] * len(fracs))
@@ -509,15 +354,11 @@ def plot_box_gain(df, save_dir):
     ax.set_title("Fine-Tuning Gain by Data Fraction")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_box_gain.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_box_gain.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 6: Filter delta vs. fine-tune gain (labeled scatter)
+# Plot 5: Filter delta vs fine-tune gain (scatter)
 # ---------------------------------------------------------------------------
 
 def plot_delta_vs_gain(df, save_dir):
@@ -547,70 +388,18 @@ def plot_delta_vs_gain(df, save_dir):
                     xycoords="axes fraction", fontsize=11)
 
     fig.tight_layout()
-    path = os.path.join(save_dir, "plot_delta_vs_gain.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_delta_vs_gain.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 7: Paired scattering vs random bar chart
+# Plot 6: Data efficiency (three-line per architecture family)
 # ---------------------------------------------------------------------------
-
-def plot_init_comparison(df, save_dir):
-    """Grouped bar: for each matched architecture, show scattering head_acc,
-    scattering finetune_acc, and random joint_acc side-by-side."""
-    pairs = _find_matched_pairs(df)
-    full_pairs = [p for p in pairs if p["data_frac"] == "100%"]
-    if not full_pairs:
-        return None
-
-    labels = [p["label"] for p in full_pairs]
-    head_vals = [p["scat"].get("head_acc", 0) or 0 for p in full_pairs]
-    ft_vals = [p["scat"].get("finetune_acc", 0) or 0 for p in full_pairs]
-    rand_vals = [p["rand"].get("joint_acc", 0) or 0 for p in full_pairs]
-
-    x = np.arange(len(labels))
-    width = 0.25
-
-    fig, ax = plt.subplots(figsize=(max(9, len(labels) * 1.2), 6))
-    ax.bar(x - width, head_vals, width,
-           label="Scattering (head only)", color="tab:blue", alpha=0.7)
-    ax.bar(x, ft_vals, width,
-           label="Scattering (fine-tuned)", color="tab:orange", alpha=0.7)
-    ax.bar(x + width, rand_vals, width,
-           label="Random init (joint)", color="tab:red", alpha=0.7)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel("Val accuracy (%)")
-    ax.set_title("Scattering Init vs Random Init (full training data)")
-    ax.legend()
-    ax.grid(True, axis="y", alpha=0.3)
-    fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_init_comparison.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Plot 8: Three-line data efficiency (random < scat-frozen < scat-finetuned)
-# ---------------------------------------------------------------------------
-
-def _base_arch_label(label):
-    """Strip data-fraction suffix (_s01, _s03, etc.) to get the base name."""
-    return re.sub(r"_s\d+$", "", label)
-
 
 def _build_init_families(df):
-    """Build scattering and random data-efficiency families for matching archs.
+    """Group matched (scat, random) pairs by architecture into families.
 
-    Returns a dict mapping base_label -> {
-        "scat_samples": [...], "scat_head": [...], "scat_ft": [...],
-        "rand_samples": [...], "rand_joint": [...]
-    }
+    Returns dict: arch_label -> {scat_samples, scat_head, scat_ft,
+    rand_samples, rand_joint}, sorted by sample count.
     """
     pairs = _find_matched_pairs(df)
     if not pairs:
@@ -618,12 +407,12 @@ def _build_init_families(df):
 
     families = {}
     for p in pairs:
-        base = _base_arch_label(p["label"])
-        families.setdefault(base, {
+        arch = p["label"]
+        families.setdefault(arch, {
             "scat_samples": [], "scat_head": [], "scat_ft": [],
             "rand_samples": [], "rand_joint": [],
         })
-        f = families[base]
+        f = families[arch]
         s = p["actual_train_samples"]
         f["scat_samples"].append(s)
         f["scat_head"].append(p["scat"].get("head_acc"))
@@ -632,23 +421,23 @@ def _build_init_families(df):
         f["rand_joint"].append(p["rand"].get("joint_acc"))
 
     result = {}
-    for base, f in families.items():
+    for name, f in families.items():
         if len(f["scat_samples"]) < 2:
             continue
         order = np.argsort(f["scat_samples"])
         for key in f:
             f[key] = [f[key][i] for i in order]
-        result[base] = f
+        result[name] = f
     return result
 
 
-def plot_init_data_efficiency(df, save_dir):
-    """Three-line plot per architecture family: random joint < scat head < scat fine-tuned."""
+def plot_data_efficiency(df, save_dir):
+    """Three-line per family: random joint, scat head, scat fine-tuned."""
     families = _build_init_families(df)
     if not families:
         return None
 
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
 
     for i, (name, f) in enumerate(sorted(families.items())):
@@ -665,60 +454,308 @@ def plot_init_data_efficiency(df, save_dir):
     ax.set_xlabel("Training samples")
     ax.set_ylabel("Val accuracy (%)")
     ax.set_title("Data Efficiency: Scattering Init vs Random Init")
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=6, ncol=3)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_init_data_efficiency.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_data_efficiency.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 9: Scattering advantage over random vs data size
+# Plot 7: Scattering advantage over random vs data size
 # ---------------------------------------------------------------------------
 
 def plot_init_advantage(df, save_dir):
-    """Line chart: accuracy advantage (scattering fine-tuned minus random joint)
-    as a function of training set size, per architecture family."""
+    """Line chart: (scat fine-tuned - random joint) vs training samples."""
     families = _build_init_families(df)
     if not families:
         return None
 
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
 
     for i, (name, f) in enumerate(sorted(families.items())):
         color = cmap(i % 10)
-        samples = f["scat_samples"]
-        advantage = [
-            (ft or 0) - (rj or 0)
-            for ft, rj in zip(f["scat_ft"], f["rand_joint"])
-        ]
-        ax.plot(samples, advantage, "o-", color=color, label=name)
-        for s, adv in zip(samples, advantage):
+        advantage = [(ft or 0) - (rj or 0)
+                     for ft, rj in zip(f["scat_ft"], f["rand_joint"])]
+        ax.plot(f["scat_samples"], advantage, "o-", color=color, label=name)
+        for s, adv in zip(f["scat_samples"], advantage):
             ax.annotate(f"{adv:+.1f}", (s, adv), fontsize=7,
-                        textcoords="offset points", xytext=(0, 6),
-                        ha="center")
+                        textcoords="offset points", xytext=(0, 6), ha="center")
 
     ax.axhline(0, color="gray", linestyle="--", linewidth=0.8)
     ax.set_xscale("log")
     ax.set_xlabel("Training samples")
     ax.set_ylabel("Accuracy advantage (%)")
     ax.set_title("Scattering Init Advantage over Random Init")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-
-    path = os.path.join(save_dir, "plot_init_advantage.png")
-    fig.savefig(path, dpi=150)
-    print(f"Saved {path}")
-    return fig
+    return _save(fig, save_dir, "plot_init_advantage.png")
 
 
 # ---------------------------------------------------------------------------
-# Plot 10: Per-experiment training curves
+# Plot 8: Heatmap -- architecture x data fraction
+# ---------------------------------------------------------------------------
+
+def plot_heatmap(df, save_dir):
+    """Side-by-side heatmaps: scattering best finetune_acc and random joint_acc."""
+    fracs = [f for f in FRAC_ORDER if f in df["data_frac"].values]
+    if not fracs:
+        return None
+
+    scat = df[~df["_is_random"]]
+    rand = df[df["_is_random"]]
+
+    arch_labels = sorted(scat["_arch_label"].unique(),
+                         key=lambda x: (int(x[0]), x))
+    if not arch_labels:
+        return None
+
+    scat_best = scat.groupby(["_arch_label", "data_frac"])["finetune_acc"].max()
+    rand_best = rand.groupby(["_arch_label", "data_frac"])["joint_acc"].max()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2,
+                                    figsize=(14, max(5, len(arch_labels) * 0.4)))
+
+    for ax, title, data in [
+        (ax1, "Scattering (best fine-tuned)", scat_best),
+        (ax2, "Random (joint)", rand_best),
+    ]:
+        mat = np.full((len(arch_labels), len(fracs)), np.nan)
+        for i, al in enumerate(arch_labels):
+            for j, fr in enumerate(fracs):
+                try:
+                    mat[i, j] = data.loc[(al, fr)]
+                except KeyError:
+                    pass
+
+        im = ax.imshow(mat, aspect="auto", cmap="YlOrRd")
+        ax.set_xticks(range(len(fracs)))
+        ax.set_xticklabels(fracs)
+        ax.set_yticks(range(len(arch_labels)))
+        ax.set_yticklabels(arch_labels, fontsize=8)
+        ax.set_xlabel("Data fraction")
+        ax.set_title(title)
+
+        vmax = np.nanmax(mat) if not np.all(np.isnan(mat)) else 1
+        for i in range(mat.shape[0]):
+            for j in range(mat.shape[1]):
+                v = mat[i, j]
+                if not np.isnan(v):
+                    ax.text(j, i, f"{v:.1f}", ha="center", va="center",
+                            fontsize=7,
+                            color="black" if v < vmax * 0.8 else "white")
+
+        fig.colorbar(im, ax=ax, shrink=0.6)
+
+    fig.suptitle("Accuracy Heatmap: Architecture x Data Fraction", fontsize=13)
+    fig.tight_layout()
+    return _save(fig, save_dir, "plot_heatmap.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 9: L2 penalty effect (scattering init only)
+# ---------------------------------------------------------------------------
+
+def plot_l2_effect(df, save_dir):
+    """Box plot: accuracy delta (l2=0.005 minus l2=0) grouped by data fraction."""
+    scat = df[~df["_is_random"]]
+    if "l2_penalty" not in scat.columns:
+        return None
+
+    fracs = [f for f in FRAC_ORDER if f in scat["data_frac"].values]
+    if not fracs:
+        return None
+
+    deltas_by_frac = {}
+    for frac in fracs:
+        sub = scat[scat["data_frac"] == frac]
+        deltas = []
+        for al in sub["_arch_label"].unique():
+            arch_sub = sub[sub["_arch_label"] == al]
+            l2_0 = arch_sub[arch_sub["l2_penalty"] == 0]["finetune_acc"]
+            l2_on = arch_sub[arch_sub["l2_penalty"] > 0]["finetune_acc"]
+            if not l2_0.empty and not l2_on.empty:
+                deltas.append(l2_on.max() - l2_0.max())
+        deltas_by_frac[frac] = np.array(deltas) if deltas else np.array([])
+
+    non_empty = [f for f in fracs if len(deltas_by_frac[f]) > 0]
+    if not non_empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    groups = [deltas_by_frac[f] for f in non_empty]
+    positions = np.arange(len(non_empty))
+    _boxplot_with_strip(ax, groups, positions, ["tab:purple"] * len(non_empty))
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.8)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(non_empty)
+    ax.set_xlabel("Training data fraction")
+    ax.set_ylabel("Accuracy delta (l2=0.005 minus l2=0)")
+    ax.set_title("L2 Anchor Penalty Effect on Scattering Init")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, save_dir, "plot_l2_effect.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 10: Paired difference (scattering - random)
+# ---------------------------------------------------------------------------
+
+def plot_paired_diff(df, save_dir):
+    """Horizontal bar: scat_best - random for every arch x fraction pair."""
+    pairs = _find_matched_pairs(df)
+    if not pairs:
+        return None
+
+    entries = []
+    for p in pairs:
+        scat_acc = p["scat"].get("finetune_acc", 0) or 0
+        rand_acc = p["rand"].get("joint_acc", 0) or 0
+        entries.append({
+            "label": f"{p['label']} ({p['data_frac']})",
+            "diff": scat_acc - rand_acc,
+        })
+
+    entries.sort(key=lambda e: e["diff"])
+    labels = [e["label"] for e in entries]
+    diffs = [e["diff"] for e in entries]
+    colors = ["tab:blue" if d >= 0 else "tab:red" for d in diffs]
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(entries) * 0.3)))
+    y = np.arange(len(entries))
+    ax.barh(y, diffs, color=colors, alpha=0.7, edgecolor="black", linewidth=0.3)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.axvline(0, color="gray", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Accuracy difference (scattering - random)")
+    ax.set_title("Scattering vs Random Init: Paired Differences")
+    ax.grid(True, axis="x", alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, save_dir, "plot_paired_diff.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 11: Mixing horizon comparison (4-block only)
+# ---------------------------------------------------------------------------
+
+def plot_mixing_horizon(df, save_dir):
+    """Grouped bar: mixing_horizon=27 vs 243 for 4-block models."""
+    sub = df[df["n_blocks"] == 4].copy()
+    if sub.empty or "mixing_horizon" not in sub.columns:
+        return None
+
+    horizons = sorted(sub["mixing_horizon"].dropna().unique())
+    if len(horizons) < 2:
+        return None
+
+    fracs = [f for f in FRAC_ORDER if f in sub["data_frac"].values]
+    if not fracs:
+        return None
+
+    scat = sub[~sub["_is_random"]]
+    rand = sub[sub["_is_random"]]
+
+    combos = []
+    for mod in sorted(scat["modulus_type"].dropna().unique()):
+        mod_short = "prelu" if mod == "phase_relu" else "cmod"
+        for lv in sorted(scat["L"].dropna().unique()):
+            for frac in fracs:
+                label = f"4b_{mod_short}_{int(lv)}L ({frac})"
+                vals = {}
+                for h in horizons:
+                    s_sub = scat[(scat["modulus_type"] == mod) &
+                                 (scat["L"] == lv) &
+                                 (scat["mixing_horizon"] == h) &
+                                 (scat["data_frac"] == frac)]
+                    r_sub = rand[(rand["modulus_type"] == mod) &
+                                 (rand["L"] == lv) &
+                                 (rand["mixing_horizon"] == h) &
+                                 (rand["data_frac"] == frac)]
+                    vals[h] = {
+                        "scat": s_sub["finetune_acc"].max() if not s_sub.empty else np.nan,
+                        "rand": r_sub["joint_acc"].max() if not r_sub.empty else np.nan,
+                    }
+                combos.append({"label": label, "vals": vals})
+
+    if not combos:
+        return None
+
+    x = np.arange(len(combos))
+    h0, h1 = horizons[0], horizons[1]
+    width = 0.2
+
+    fig, ax = plt.subplots(figsize=(max(12, len(combos) * 0.8), 6))
+
+    ax.bar(x - 1.5 * width,
+           [c["vals"][h0]["scat"] for c in combos], width,
+           label=f"Scat h={int(h0)}", color="tab:blue", alpha=0.7)
+    ax.bar(x - 0.5 * width,
+           [c["vals"][h1]["scat"] for c in combos], width,
+           label=f"Scat h={int(h1)}", color="tab:cyan", alpha=0.7)
+    ax.bar(x + 0.5 * width,
+           [c["vals"][h0]["rand"] for c in combos], width,
+           label=f"Rand h={int(h0)}", color="tab:red", alpha=0.7)
+    ax.bar(x + 1.5 * width,
+           [c["vals"][h1]["rand"] for c in combos], width,
+           label=f"Rand h={int(h1)}", color="tab:orange", alpha=0.7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([c["label"] for c in combos], rotation=45, ha="right",
+                       fontsize=7)
+    ax.set_ylabel("Val accuracy (%)")
+    ax.set_title("Mixing Horizon Comparison (4-block models)")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, save_dir, "plot_mixing_horizon.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 12: Best architecture per data fraction
+# ---------------------------------------------------------------------------
+
+def plot_best_summary(df, save_dir):
+    """Bar chart: best scattering accuracy per data fraction, labelled with arch."""
+    scat = df[~df["_is_random"]]
+
+    fracs = [f for f in FRAC_ORDER if f in scat["data_frac"].values]
+    if not fracs:
+        return None
+
+    best_accs, best_labels = [], []
+    for frac in fracs:
+        sub = scat[scat["data_frac"] == frac]
+        if sub.empty:
+            best_accs.append(0)
+            best_labels.append("n/a")
+            continue
+        idx = sub["finetune_acc"].idxmax()
+        best_accs.append(sub.loc[idx, "finetune_acc"])
+        best_labels.append(sub.loc[idx, "_arch_label"])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(fracs))
+    bars = ax.bar(x, best_accs, color="tab:green", alpha=0.7,
+                  edgecolor="black", linewidth=0.5)
+
+    for bar, lbl in zip(bars, best_labels):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                lbl, ha="center", va="bottom", fontsize=8, rotation=20)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(fracs)
+    ax.set_xlabel("Training data fraction")
+    ax.set_ylabel("Best val accuracy (%)")
+    ax.set_title("Best Scattering Architecture per Data Fraction")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    return _save(fig, save_dir, "plot_best_summary.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 13: Per-experiment training curves (optional)
 # ---------------------------------------------------------------------------
 
 def plot_training_curves(df, save_dir):
@@ -763,7 +800,7 @@ def plot_training_curves(df, save_dir):
         plt.close(fig)
         count += 1
 
-    print(f"Saved {count} training curve(s) -> {curves_dir}/")
+    print(f"  Saved {count} training curve(s) -> {curves_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +809,7 @@ def plot_training_curves(df, save_dir):
 
 def main():
     p = argparse.ArgumentParser(description="Analyze experiment results")
-    p.add_argument("--results-dir", default="runs",
+    p.add_argument("--results-dir", default="cifar_exps",
                    help="directory containing results_*.json files")
     p.add_argument("--recursive", action="store_true",
                    help="search subdirectories for results_*.json")
@@ -788,15 +825,19 @@ def main():
     plot_dir = os.path.join(args.results_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
+    print("Generating plots...")
     plot_arch_comparison(df, plot_dir)
     plot_box_modulus(df, plot_dir)
     plot_box_depth(df, plot_dir)
-    plot_data_efficiency(df, plot_dir)
     plot_box_gain(df, plot_dir)
     plot_delta_vs_gain(df, plot_dir)
-    plot_init_comparison(df, plot_dir)
-    plot_init_data_efficiency(df, plot_dir)
+    plot_data_efficiency(df, plot_dir)
     plot_init_advantage(df, plot_dir)
+    plot_heatmap(df, plot_dir)
+    plot_l2_effect(df, plot_dir)
+    plot_paired_diff(df, plot_dir)
+    plot_mixing_horizon(df, plot_dir)
+    plot_best_summary(df, plot_dir)
 
     if args.curves:
         plot_training_curves(df, plot_dir)

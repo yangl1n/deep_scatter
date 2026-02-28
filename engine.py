@@ -55,13 +55,16 @@ def accuracy(output, target, topk=(1,)):
 # ---------------------------------------------------------------------------
 
 def run_epoch(loader, model, criterion, optimizer, device,
-              is_training, print_freq=50, verbose=True):
+              is_training, print_freq=50, verbose=True, anchor_reg=None):
     """Run one epoch of training or evaluation.
 
     Parameters
     ----------
     verbose : bool
         If False, suppress batch-level prints (use for non-main DDP ranks).
+    anchor_reg : AnchorPenalty or None
+        If provided (and training), its output is added to the loss before
+        ``.backward()``.  Expects the *raw* (unwrapped) model as argument.
 
     Returns
     -------
@@ -85,6 +88,9 @@ def run_epoch(loader, model, criterion, optimizer, device,
 
             outputs = model(inputs)
             loss = criterion(outputs, targets)
+            if is_training and anchor_reg is not None:
+                raw = model.module if hasattr(model, "module") else model
+                loss = loss + anchor_reg(raw)
 
             if is_training:
                 optimizer.zero_grad()
@@ -155,6 +161,39 @@ class EarlyStopping:
             return False
         self.counter += 1
         return self.counter >= self.patience
+
+
+# ---------------------------------------------------------------------------
+# L2 anchor penalty (L2-SP regularization)
+# ---------------------------------------------------------------------------
+
+class AnchorPenalty:
+    """Penalise extractor weight drift from an initial snapshot.
+
+    Computes ``lam * sum_i ||theta_i - theta_i^0||^2`` over all extractor
+    parameters, where theta^0 is the snapshot taken before fine-tuning.
+
+    Parameters
+    ----------
+    named_params_snapshot : dict
+        Output of ``snapshot_extractor_params`` (name -> CPU tensor).
+    lam : float
+        Penalty strength (lambda).
+    device : torch.device
+        Device to store anchor tensors on (should match model device).
+    """
+
+    def __init__(self, named_params_snapshot, lam, device):
+        self.anchor = {k: v.to(device) for k, v in named_params_snapshot.items()}
+        self.lam = lam
+
+    def __call__(self, raw_model):
+        penalty = sum(
+            (p - self.anchor[n]).pow(2).sum()
+            for n, p in raw_model.blocks.named_parameters()
+            if n in self.anchor
+        )
+        return self.lam * penalty
 
 
 # ---------------------------------------------------------------------------

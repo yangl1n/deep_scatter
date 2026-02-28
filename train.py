@@ -29,7 +29,7 @@ import torch.backends.cudnn as cudnn
 
 from scattering_net import ScatteringNet
 from data import build_dataloaders
-from engine import (run_epoch, EarlyStopping,
+from engine import (run_epoch, EarlyStopping, AnchorPenalty,
                     snapshot_extractor_params, compute_filter_delta)
 from utils import (get_raw_model, save_checkpoint, load_checkpoint,
                    ExperimentLogger, init_distributed, cleanup_distributed,
@@ -47,7 +47,7 @@ def parse_args():
     # Dataset
     g = p.add_argument_group("Dataset")
     g.add_argument("--dataset", default="cifar10",
-                   choices=["cifar10", "imagenet"])
+                   choices=["cifar10", "cifar100", "imagenet"])
     g.add_argument("--data-dir", default="./data",
                    help="root directory for dataset (ImageNet: parent of "
                         "train/ and val/)")
@@ -88,6 +88,9 @@ def parse_args():
                    help="classifier head learning rate (both phases)")
     g.add_argument("--lr-extractor", default=1e-4, type=float,
                    help="feature extractor learning rate (Phase B)")
+    g.add_argument("--l2-penalty", default=0, type=float,
+                   help="L2-SP anchor penalty lambda for Phase B "
+                        "(penalises drift from init weights; 0=off)")
 
     # Common training
     g = p.add_argument_group("Training")
@@ -119,7 +122,7 @@ def parse_args():
 
 def _run_phase(tag, model, train_loader, val_loader, optimizer, scheduler,
                criterion, device, epochs, patience, print_freq, save_dir,
-               logger):
+               logger, anchor_reg=None):
     """Generic epoch loop with early stopping and checkpoint saving.
 
     Returns best_val_acc (top-1).
@@ -138,7 +141,8 @@ def _run_phase(tag, model, train_loader, val_loader, optimizer, scheduler,
 
         train_loss, train_acc1, _ = run_epoch(
             train_loader, model, criterion, optimizer, device,
-            is_training=True, print_freq=print_freq, verbose=verbose)
+            is_training=True, print_freq=print_freq, verbose=verbose,
+            anchor_reg=anchor_reg)
 
         val_loss, val_acc1, val_acc5 = run_epoch(
             val_loader, model, criterion, None, device,
@@ -382,6 +386,13 @@ def _run_two_phase(args, model, raw, head_params, train_loader, val_loader,
 
     param_snapshot = snapshot_extractor_params(raw)
 
+    anchor_reg = None
+    if args.l2_penalty > 0:
+        anchor_reg = AnchorPenalty(param_snapshot, args.l2_penalty, device)
+        if is_main_process():
+            print(f"L2 anchor penalty: lambda={args.l2_penalty}")
+    logger.set_result("l2_penalty", args.l2_penalty)
+
     for block in raw.blocks:
         block.unfreeze()
 
@@ -403,7 +414,7 @@ def _run_two_phase(args, model, raw, head_params, train_loader, val_loader,
         optimizer_b, scheduler_b, criterion, device,
         epochs=args.epochs, patience=args.patience,
         print_freq=args.print_freq, save_dir=phase_b_dir,
-        logger=logger)
+        logger=logger, anchor_reg=anchor_reg)
 
     finetune_gain = finetune_acc - baseline_acc
     delta_l2, delta_rel = compute_filter_delta(param_snapshot, raw)
